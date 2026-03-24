@@ -27,12 +27,9 @@ struct device_rumble_slot {
 
 struct device_rumble_state {
     struct device_rumble_slot slots[DEVICE_RUMBLE_EFFECT_SLOTS];
-    bool playing[DEVICE_RUMBLE_EFFECT_SLOTS];
-    struct timespec play_start[DEVICE_RUMBLE_EFFECT_SLOTS];
-    unsigned int gain;
-    unsigned int target_magnitude;
-    struct timespec pwm_phase_end;
-    bool pwm_active;
+    int active_id;
+    bool has_stop_time;
+    struct timespec stop_time;
     const struct device_rumble_driver *driver;
     void *driver_ctx;
     bool motor_on;
