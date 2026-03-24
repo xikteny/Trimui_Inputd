@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <poll.h>
 
 static inline void set_motor(struct device_rumble_state *st, bool on)
 {
@@ -165,6 +166,7 @@ int device_rumble_init(struct device_rumble_state *st, const struct device_rumbl
     }
     memset(st, 0, sizeof(*st));
     st->active_id = -1;
+    st->ff_fd = -1;
     st->driver = driver;
 
     if (!driver->init || !driver->set || !driver->close || driver->ctx_size == 0) {
@@ -199,37 +201,114 @@ void device_rumble_close(struct device_rumble_state *st)
     memset(st, 0, sizeof(*st));
 }
 
-bool device_rumble_poll(struct device_rumble_state *st, struct gamepad *gp)
+static void *ff_thread_fn(void *arg)
 {
-    if (!st || !gp) {
-        return false;
-    }
-    int fd = gamepad_get_fd(gp);
-    if (fd < 0) {
-        return false;
-    }
+    struct device_rumble_state *st = arg;
+    int fd = st->ff_fd;
 
-    struct input_event ev;
-    for (;;) {
-        int r = gamepad_read_event(gp, &ev);
-        if (r < 0) {
-            return false;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+
+    while (st->ff_running) {
+        int timeout_ms;
+        if (st->has_stop_time && st->active_id >= 0 && st->motor_on) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                long ms = (st->stop_time.tv_sec - now.tv_sec) * 1000L
+                          + (st->stop_time.tv_nsec - now.tv_nsec) / 1000000L;
+                timeout_ms = (ms > 1) ? (int)ms : 1;
+            } else {
+                timeout_ms = 200;
+            }
+        } else {
+            timeout_ms = 200;
         }
-        if (r == 0) {
+
+        pfd.revents = 0;
+        int r = poll(&pfd, 1, timeout_ms);
+
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("FF thread: poll failed");
             break;
         }
 
-        if (ev.type == EV_UINPUT) {
-            if (ev.code == UI_FF_UPLOAD) {
-                handle_upload(st, fd, (uint32_t)ev.value);
-            } else if (ev.code == UI_FF_ERASE) {
-                handle_erase(st, fd, (uint32_t)ev.value);
-            }
-        } else if (ev.type == EV_FF) {
-            handle_play_event(st, (int)ev.code, (int)ev.value);
+        if (r == 0) {
+            maybe_stop_on_timeout(st);
+            continue;
         }
+
+        if (!(pfd.revents & POLLIN)) {
+            continue;
+        }
+
+        struct input_event ev;
+        for (;;) {
+            ssize_t n = read(fd, &ev, sizeof(ev));
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("FF thread: read failed");
+                st->ff_running = 0;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            if ((size_t)n < sizeof(ev)) {
+                break;
+            }
+
+            if (ev.type == EV_UINPUT) {
+                if (ev.code == UI_FF_UPLOAD) {
+                    handle_upload(st, fd, (uint32_t)ev.value);
+                } else if (ev.code == UI_FF_ERASE) {
+                    handle_erase(st, fd, (uint32_t)ev.value);
+                }
+            } else if (ev.type == EV_FF) {
+                handle_play_event(st, (int)ev.code, (int)ev.value);
+            }
+        }
+
+        maybe_stop_on_timeout(st);
     }
 
-    maybe_stop_on_timeout(st);
-    return true;
+    return NULL;
+}
+
+int device_rumble_start_thread(struct device_rumble_state *st, struct gamepad *gp)
+{
+    if (!st || !gp) {
+        return -1;
+    }
+    int fd = gamepad_get_fd(gp);
+    if (fd < 0) {
+        return -1;
+    }
+    st->ff_fd = fd;
+    st->ff_running = 1;
+    if (pthread_create(&st->ff_thread, NULL, ff_thread_fn, st) != 0) {
+        perror("pthread_create ff_thread");
+        st->ff_running = 0;
+        st->ff_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+void device_rumble_stop_thread(struct device_rumble_state *st)
+{
+    if (!st || !st->ff_running) {
+        return;
+    }
+    st->ff_running = 0;
+    if (pthread_join(st->ff_thread, NULL) != 0) {
+        perror("pthread_join ff_thread");
+    }
+    st->ff_fd = -1;
 }
