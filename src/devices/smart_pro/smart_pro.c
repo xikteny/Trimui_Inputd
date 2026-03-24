@@ -196,6 +196,13 @@ int smart_pro_init(void **ctx, struct gamepad *gp, struct axis_state *lx, struct
         sunxi_gpio_close();
         return -1;
     }
+    if (device_rumble_start_thread(&dev->rumble, dev->left.c.gp) < 0) {
+        device_rumble_close(&dev->rumble);
+        close(fd_left);
+        close(fd_right);
+        sunxi_gpio_close();
+        return -1;
+    }
 
     *ctx = dev;
     return 0;
@@ -207,10 +214,6 @@ bool smart_pro_poll(void *ctx)
     uint8_t buf[128];
     uint8_t frame_bytes[8];
     device_dirty_reset(&dev->dirty, poll_switch(dev->left.c.gp, SP_GPIO_INPUT, &dev->left.last_switch));
-
-    if (!device_rumble_poll(&dev->rumble, dev->left.c.gp)) {
-        return false;
-    }
 
     dev->pfds[0].revents = 0;
     dev->pfds[1].revents = 0;
@@ -262,6 +265,7 @@ void smart_pro_close(void *ctx)
     if (!dev) return;
     close(dev->left.c.fd);
     close(dev->right.c.fd);
+    device_rumble_stop_thread(&dev->rumble);
     device_rumble_close(&dev->rumble);
     sunxi_gpio_close();
     memset(dev, 0, sizeof(*dev));
