@@ -88,6 +88,17 @@ static const struct gamepad_abs_desc SP_AXES[] = {
 /* Switch list advertised by the Smart Pro controller (tablet mode). */
 static const unsigned short SP_SWITCHES[] = {SW_TABLET_MODE};
 
+/* FF effect types advertised by the Smart Pro controller (includes FF_GAIN for
+   clients such as RetroArch that use it to set overall rumble intensity). */
+static const unsigned short SP_FF_EFFECTS[] = {
+    FF_RUMBLE,
+    FF_PERIODIC,
+    FF_SQUARE,
+    FF_TRIANGLE,
+    FF_SINE,
+    FF_GAIN,
+};
+
 /* Input device descriptor presented to the OS for Smart Pro. */
 static const struct gamepad_desc SMART_PRO_GAMEPAD_DESC = {
     .name = "TRIMUI Smart Pro Controller",
@@ -105,4 +116,6 @@ static const struct gamepad_desc SMART_PRO_GAMEPAD_DESC = {
     .switch_count = sizeof(SP_SWITCHES) / sizeof(SP_SWITCHES[0]),
     .ff_effects_max = DEVICE_RUMBLE_EFFECT_SLOTS,
     .enable_ff_rumble = true,
+    .ff_effects = SP_FF_EFFECTS,
+    .ff_effect_count = sizeof(SP_FF_EFFECTS) / sizeof(SP_FF_EFFECTS[0]),
 };
