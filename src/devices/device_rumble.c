@@ -11,10 +11,6 @@
 #include <stdlib.h>
 #include <poll.h>
 
-/* Software PWM parameters for intensity modulation of the binary motor. */
-#define RUMBLE_PWM_PERIOD_US 20000u   /* 20 ms period = 50 Hz */
-#define RUMBLE_MAG_THRESHOLD 0x0CCCu  /* ~5% of 0xFFFF — below this, skip the motor */
-
 static inline void set_motor(struct device_rumble_state *st, bool on)
 {
     if (!st->initialized || !st->driver || !st->driver_ctx) {
@@ -40,22 +36,19 @@ static inline unsigned int effect_magnitude(const struct ff_effect *eff)
     return (strong > weak) ? strong : weak;
 }
 
+static void stop_rumble(struct device_rumble_state *st)
+{
+    st->active_id = -1;
+    st->has_stop_time = false;
+    set_motor(st, false);
+}
+
 static inline void timespec_add_ms(struct timespec *ts, unsigned int ms)
 {
     ts->tv_sec += ms / 1000u;
     ts->tv_nsec += (long)(ms % 1000u) * 1000000L;
     if (ts->tv_nsec >= 1000000000L) {
         ts->tv_sec += 1;
-        ts->tv_nsec -= 1000000000L;
-    }
-}
-
-static inline void timespec_add_us(struct timespec *ts, unsigned int us)
-{
-    ts->tv_sec += us / 1000000u;
-    ts->tv_nsec += (long)(us % 1000000u) * 1000L;
-    while (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec++;
         ts->tv_nsec -= 1000000000L;
     }
 }
@@ -68,210 +61,47 @@ static inline bool timespec_ge(const struct timespec *a, const struct timespec *
     return a->tv_nsec >= b->tv_nsec;
 }
 
-/* Returns milliseconds until slot i's replay expires, or -1 if no timeout. */
-static long slot_ms_until_expiry(const struct device_rumble_state *st, int i,
-                                  const struct timespec *now)
+static void maybe_stop_on_timeout(struct device_rumble_state *st)
 {
-    const struct ff_effect *eff = &st->slots[i].effect;
-    if (eff->replay.length == 0) {
-        return -1;
+    if (!st->has_stop_time || st->active_id < 0 || !st->motor_on) {
+        return;
     }
-    struct timespec expiry = st->play_start[i];
-    timespec_add_ms(&expiry, eff->replay.length);
-    long ms = (expiry.tv_sec - now->tv_sec) * 1000L
-              + (expiry.tv_nsec - now->tv_nsec) / 1000000L;
-    return ms;
-}
-
-/*
- * Recalculate the effective motor intensity from all currently-playing,
- * non-expired effect slots and the global gain.  Expire any timed-out slots
- * and update the PWM state accordingly.
- *
- *  effective = max_magnitude_across_playing_slots * gain / 0xFFFF
- *
- * Three operating modes:
- *   effective < THRESHOLD   → motor off,   no PWM
- *   effective >= 0xFFFF     → motor full on, no PWM
- *   otherwise               → software PWM (50 Hz), duty ∝ effective
- */
-static void recalculate_pwm(struct device_rumble_state *st)
-{
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
         return;
     }
-
-    unsigned int max_mag = 0;
-    for (int i = 0; i < DEVICE_RUMBLE_EFFECT_SLOTS; i++) {
-        if (!st->playing[i] || !st->slots[i].used) {
-            continue;
-        }
-        if (st->slots[i].effect.replay.length > 0 &&
-            slot_ms_until_expiry(st, i, &now) <= 0) {
-            st->playing[i] = false;
-            continue;
-        }
-        unsigned int mag = effect_magnitude(&st->slots[i].effect);
-        if (mag > max_mag) {
-            max_mag = mag;
-        }
+    if (timespec_ge(&now, &st->stop_time)) {
+        stop_rumble(st);
     }
-
-    unsigned int effective =
-        (unsigned int)(((uint64_t)max_mag * st->gain) / 0xFFFFu);
-    st->target_magnitude = effective;
-
-    if (effective < RUMBLE_MAG_THRESHOLD) {
-        set_motor(st, false);
-        st->pwm_active = false;
-        return;
-    }
-
-    if (effective >= 0xFFFFu) {
-        set_motor(st, true);
-        st->pwm_active = false;
-        return;
-    }
-
-    /* Start a fresh PWM on-phase. */
-    unsigned int on_us = (effective * RUMBLE_PWM_PERIOD_US) / 0xFFFFu;
-    if (on_us == 0) {
-        set_motor(st, false);
-        st->pwm_active = false;
-        return;
-    }
-    set_motor(st, true);
-    st->pwm_active = true;
-    st->pwm_phase_end = now;
-    timespec_add_us(&st->pwm_phase_end, on_us);
-}
-
-/*
- * Handle a PWM phase transition when pwm_phase_end has been reached.
- * Toggles the motor on→off or off→on and schedules the next phase.
- */
-static void handle_pwm_transition(struct device_rumble_state *st,
-                                   const struct timespec *now)
-{
-    if (!st->pwm_active || !timespec_ge(now, &st->pwm_phase_end)) {
-        return;
-    }
-
-    unsigned int on_us = (st->target_magnitude * RUMBLE_PWM_PERIOD_US) / 0xFFFFu;
-
-    if (st->motor_on) {
-        /* ON phase ended → start OFF phase. */
-        unsigned int off_us = RUMBLE_PWM_PERIOD_US - on_us;
-        if (off_us == 0) {
-            /* Essentially 100% duty — stay on and reschedule a full period. */
-            st->pwm_phase_end = *now;
-            timespec_add_us(&st->pwm_phase_end, RUMBLE_PWM_PERIOD_US);
-            return;
-        }
-        set_motor(st, false);
-        st->pwm_phase_end = *now;
-        timespec_add_us(&st->pwm_phase_end, off_us);
-    } else {
-        /* OFF phase ended → start ON phase. */
-        if (on_us == 0) {
-            set_motor(st, false);
-            st->pwm_active = false;
-            return;
-        }
-        set_motor(st, true);
-        st->pwm_phase_end = *now;
-        timespec_add_us(&st->pwm_phase_end, on_us);
-    }
-}
-
-/*
- * Check for expired slots and handle PWM phase transitions.
- * Called on every poll wakeup (timeout or event).
- */
-static void service_timers(struct device_rumble_state *st)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
-        return;
-    }
-
-    bool any_expired = false;
-    for (int i = 0; i < DEVICE_RUMBLE_EFFECT_SLOTS; i++) {
-        if (!st->playing[i] || !st->slots[i].used) {
-            continue;
-        }
-        if (st->slots[i].effect.replay.length > 0 &&
-            slot_ms_until_expiry(st, i, &now) <= 0) {
-            st->playing[i] = false;
-            any_expired = true;
-        }
-    }
-
-    if (any_expired) {
-        recalculate_pwm(st);
-        return;
-    }
-
-    handle_pwm_transition(st, &now);
-}
-
-/* Compute the next poll timeout in milliseconds. */
-static int compute_poll_timeout(const struct device_rumble_state *st)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
-        return 200;
-    }
-
-    long min_ms = 200;
-
-    if (st->pwm_active) {
-        long ms = (st->pwm_phase_end.tv_sec - now.tv_sec) * 1000L
-                  + (st->pwm_phase_end.tv_nsec - now.tv_nsec) / 1000000L;
-        if (ms < min_ms) {
-            min_ms = ms;
-        }
-    }
-
-    for (int i = 0; i < DEVICE_RUMBLE_EFFECT_SLOTS; i++) {
-        if (!st->playing[i] || !st->slots[i].used) {
-            continue;
-        }
-        if (st->slots[i].effect.replay.length == 0) {
-            continue;
-        }
-        long ms = slot_ms_until_expiry(st, i, &now);
-        if (ms >= 0 && ms < min_ms) {
-            min_ms = ms;
-        }
-    }
-
-    return (min_ms > 1) ? (int)min_ms : 1;
 }
 
 static void handle_play_event(struct device_rumble_state *st, int effect_id, int value)
 {
+    if (value == 0) {
+        stop_rumble(st);
+        return;
+    }
     if (effect_id < 0 || effect_id >= DEVICE_RUMBLE_EFFECT_SLOTS) {
         return;
     }
-
-    if (value == 0) {
-        st->playing[effect_id] = false;
-    } else {
-        if (!st->slots[effect_id].used ||
-            st->slots[effect_id].effect.type != FF_RUMBLE) {
-            return;
-        }
-        st->playing[effect_id] = true;
-        if (clock_gettime(CLOCK_MONOTONIC, &st->play_start[effect_id]) < 0) {
-            /* Cannot record start time; skip starting this effect. */
-            st->playing[effect_id] = false;
-            return;
-        }
+    if (!st->slots[effect_id].used || st->slots[effect_id].effect.type != FF_RUMBLE) {
+        return;
     }
 
-    recalculate_pwm(st);
+    const struct ff_effect *eff = &st->slots[effect_id].effect;
+    unsigned int mag = effect_magnitude(eff);
+    st->active_id = effect_id;
+    st->has_stop_time = false;
+    st->stop_time = (struct timespec){0, 0};
+    if (eff->replay.length > 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &st->stop_time) == 0) {
+            timespec_add_ms(&st->stop_time, eff->replay.length);
+            st->has_stop_time = true;
+        } else {
+            st->has_stop_time = false;
+        }
+    }
+    set_motor(st, mag > 0);
 }
 
 static void handle_upload(struct device_rumble_state *st, int fd, uint32_t request_id)
@@ -292,8 +122,8 @@ static void handle_upload(struct device_rumble_state *st, int fd, uint32_t reque
     } else {
         st->slots[id].effect = upload.effect;
         st->slots[id].used = true;
-        if (st->playing[id]) {
-            recalculate_pwm(st);
+        if (st->active_id == id && effect_magnitude(&upload.effect) == 0) {
+            stop_rumble(st);
         }
     }
 
@@ -319,9 +149,8 @@ static void handle_erase(struct device_rumble_state *st, int fd, uint32_t reques
         erase.retval = -EINVAL;
     } else {
         st->slots[id].used = false;
-        if (st->playing[id]) {
-            st->playing[id] = false;
-            recalculate_pwm(st);
+        if (st->active_id == id) {
+            stop_rumble(st);
         }
     }
 
@@ -336,7 +165,7 @@ int device_rumble_init(struct device_rumble_state *st, const struct device_rumbl
         return -1;
     }
     memset(st, 0, sizeof(*st));
-    st->gain = 0xFFFFu;  /* Default to 100% — unchanged for clients that don't send FF_GAIN. */
+    st->active_id = -1;
     st->ff_fd = -1;
     st->driver = driver;
 
@@ -380,7 +209,19 @@ static void *ff_thread_fn(void *arg)
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
 
     while (st->ff_running) {
-        int timeout_ms = compute_poll_timeout(st);
+        int timeout_ms;
+        if (st->has_stop_time && st->active_id >= 0 && st->motor_on) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                long ms = (st->stop_time.tv_sec - now.tv_sec) * 1000L
+                          + (st->stop_time.tv_nsec - now.tv_nsec) / 1000000L;
+                timeout_ms = (ms > 1) ? (int)ms : 1;
+            } else {
+                timeout_ms = 200;
+            }
+        } else {
+            timeout_ms = 200;
+        }
 
         pfd.revents = 0;
         int r = poll(&pfd, 1, timeout_ms);
@@ -394,12 +235,11 @@ static void *ff_thread_fn(void *arg)
         }
 
         if (r == 0) {
-            service_timers(st);
+            maybe_stop_on_timeout(st);
             continue;
         }
 
         if (!(pfd.revents & POLLIN)) {
-            service_timers(st);
             continue;
         }
 
@@ -431,20 +271,11 @@ static void *ff_thread_fn(void *arg)
                     handle_erase(st, fd, (uint32_t)ev.value);
                 }
             } else if (ev.type == EV_FF) {
-                if (ev.code == FF_GAIN) {
-                    unsigned int g = (unsigned int)ev.value;
-                    if (g > 0xFFFFu) {
-                        g = 0xFFFFu;
-                    }
-                    st->gain = g;
-                    recalculate_pwm(st);
-                } else {
-                    handle_play_event(st, (int)ev.code, (int)ev.value);
-                }
+                handle_play_event(st, (int)ev.code, (int)ev.value);
             }
         }
 
-        service_timers(st);
+        maybe_stop_on_timeout(st);
     }
 
     return NULL;
