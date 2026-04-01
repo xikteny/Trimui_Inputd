@@ -391,21 +391,6 @@ static void handle_upload(struct device_rumble_state *st, int fd, uint32_t reque
     }
 }
 
-/*
- * Workaround for a RetroArch bug in udev_set_rumble(): RetroArch caches
- * configured_strength per effect and skips re-uploading if the strength
- * matches the cached value.  It never resets this cache when effects are
- * erased (e.g. via input_ff_flush() on menu open / gain change).  As a
- * result, after an erase RetroArch sends a play event for the old effect ID
- * without re-uploading; the kernel then silently drops the play event because
- * the effect no longer has an owner.
- *
- * Fix: respond to every erase request with retval = -ENOSYS so the kernel
- * keeps the effect in its internal tables (effect_owners[], effects[]).
- * The play event RetroArch later sends will therefore still be valid and the
- * kernel will forward it to us.  We do stop local playback so the motor turns
- * off as expected, but we intentionally leave slots[id].used intact.
- */
 static void handle_erase(struct device_rumble_state *st, int fd, uint32_t request_id)
 {
     struct uinput_ff_erase erase;
@@ -423,20 +408,10 @@ static void handle_erase(struct device_rumble_state *st, int fd, uint32_t reques
         rumble_log("erase: effect id=%d out of range\n", id);
         erase.retval = -EINVAL;
     } else {
-        rumble_log("erase: effect id=%d (rejecting to work around RetroArch stale-effect bug)\n", id);
-        /* Stop playback if this effect was playing. */
-        if (st->playing[id]) {
-            st->playing[id] = false;
-            recalculate_pwm(st);
-        }
-        /* Deliberately do NOT clear slots[id].used or the effect data.
-         * Return an error so the kernel keeps the effect in its internal
-         * tables.  This works around a RetroArch bug where udev_set_rumble()
-         * caches configured_strength and skips re-uploading effects after
-         * an erase, then sends play events for the erased effect IDs.
-         * By refusing the erase, the kernel still considers the effect
-         * valid and will forward those stale play events to us. */
-        erase.retval = -ENOSYS;
+        rumble_log("erase: effect id=%d\n", id);
+        st->slots[id].used = false;
+        st->playing[id] = false;
+        recalculate_pwm(st);
     }
 
     if (ioctl(fd, UI_END_FF_ERASE, &erase) < 0) {
