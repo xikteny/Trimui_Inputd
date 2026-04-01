@@ -92,16 +92,6 @@ enum { BRICK_GPIO_SWITCH = 243 }; /* Same GPIO used by Smart Pro tablet switch. 
 
 static const unsigned short BRICK_SWITCHES[] = {SW_TABLET_MODE};
 
-/* Force feedback capabilities exposed for the Brick controller (advertise only). */
-static const unsigned short BRICK_FF_EFFECTS[] = {
-    FF_RUMBLE,
-    FF_PERIODIC,
-    FF_SQUARE,
-    FF_TRIANGLE,
-    FF_SINE,
-    FF_GAIN,
-};
-
 /* Gamepad description presented to the OS for the Brick controller. */
 static const struct gamepad_desc BRICK_GAMEPAD_DESC = {
     .name = "TRIMUI Brick Controller",
@@ -119,6 +109,4 @@ static const struct gamepad_desc BRICK_GAMEPAD_DESC = {
     .switch_count = sizeof(BRICK_SWITCHES) / sizeof(BRICK_SWITCHES[0]),
     .ff_effects_max = DEVICE_RUMBLE_EFFECT_SLOTS,
     .enable_ff_rumble = true,
-    .ff_effects = BRICK_FF_EFFECTS,
-    .ff_effect_count = sizeof(BRICK_FF_EFFECTS) / sizeof(BRICK_FF_EFFECTS[0]),
 };
