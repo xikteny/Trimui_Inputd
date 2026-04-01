@@ -17,13 +17,23 @@
 /* Software PWM period: 50 Hz / 20 ms. */
 #define RUMBLE_PWM_PERIOD_US 20000u
 
-/* Dead-zone threshold: below ~5% effective magnitude the motor is off. */
-#define RUMBLE_MAG_THRESHOLD 0x0CCCu
+/* Stepped duty-cycle tiers for binary GPIO motor.
+ *
+ * Fine-grained PWM is imperceptible on a binary motor; instead we use
+ * four tiers (off + three active duty cycles) that produce distinct
+ * vibration intensities.
+ *
+ *   effective < TIER_OFF           → motor off  (0% duty)
+ *   TIER_OFF  ≤ effective < TIER1  → 50% duty   (10 ms on / 10 ms off)
+ *   TIER1     ≤ effective < TIER2  → 75% duty   (15 ms on /  5 ms off)
+ *   TIER2     ≤ effective          → 100% duty  (always on)
+ */
+#define RUMBLE_TIER_OFF   0x0CCCu   /* ~5%  */
+#define RUMBLE_TIER1      0x6666u   /* ~40% */
+#define RUMBLE_TIER2      0xC000u   /* ~76% */
 
-/* Above ~75% effective magnitude, run motor at full power (no PWM).
- * On a binary motor, PWM above this level is indistinguishable from
- * full-on and just introduces unnecessary buzzing. */
-#define RUMBLE_FULL_ON_THRESHOLD 0xC000u
+#define RUMBLE_DUTY_TIER0_ON_US  10000u  /* 50% of 20 ms */
+#define RUMBLE_DUTY_TIER1_ON_US  15000u  /* 75% of 20 ms */
 
 #define RUMBLE_DEBUG_LOG "/tmp/rumble_debug.log"
 
@@ -138,7 +148,6 @@ static void recalculate_pwm(struct device_rumble_state *st)
         if (!st->playing[i] || !st->slots[i].used) {
             continue;
         }
-        /* Check per-slot expiry. */
         if (st->slots[i].effect.replay.length > 0) {
             struct timespec stop = st->play_start[i];
             timespec_add_ms(&stop, st->slots[i].effect.replay.length);
@@ -159,27 +168,31 @@ static void recalculate_pwm(struct device_rumble_state *st)
     unsigned int effective = (unsigned int)(((uint64_t)max_mag * st->gain) / 0xFFFFu);
     st->target_magnitude = effective;
 
-    /* Increment generation before changing PWM state so any in-flight
-     * handle_pwm_transition() call sees a mismatched generation. */
     st->pwm_generation++;
 
-    if (effective < RUMBLE_MAG_THRESHOLD) {
+    if (effective < RUMBLE_TIER_OFF) {
         rumble_log("recalc: max_mag=0x%04x gain=0x%04x effective=0x%04x -> OFF\n",
                    max_mag, st->gain, effective);
         set_motor(st, false);
         st->pwm_active = false;
-    } else if (effective >= RUMBLE_FULL_ON_THRESHOLD) {
-        /* Common RetroArch magnitudes (e.g. strong_magnitude=0x7FFF) at full
-         * gain fall well below 0xFFFF; treat anything above ~75% as full-on. */
-        rumble_log("recalc: max_mag=0x%04x gain=0x%04x effective=0x%04x -> FULL ON\n",
+    } else if (effective >= RUMBLE_TIER2) {
+        rumble_log("recalc: max_mag=0x%04x gain=0x%04x effective=0x%04x -> FULL ON (100%%)\n",
                    max_mag, st->gain, effective);
         set_motor(st, true);
         st->pwm_active = false;
     } else {
-        /* Start a fresh PWM on-phase. */
-        unsigned int on_us = (effective * RUMBLE_PWM_PERIOD_US) / 0xFFFFu;
-        rumble_log("recalc: max_mag=0x%04x gain=0x%04x effective=0x%04x -> PWM on_us=%u\n",
-                   max_mag, st->gain, effective, on_us);
+        /* Determine on-time from tier. */
+        unsigned int on_us;
+        const char *tier_name;
+        if (effective < RUMBLE_TIER1) {
+            on_us = RUMBLE_DUTY_TIER0_ON_US;  /* 50% */
+            tier_name = "50%";
+        } else {
+            on_us = RUMBLE_DUTY_TIER1_ON_US;  /* 75% */
+            tier_name = "75%";
+        }
+        rumble_log("recalc: max_mag=0x%04x gain=0x%04x effective=0x%04x -> PWM %s on_us=%u\n",
+                   max_mag, st->gain, effective, tier_name, on_us);
         set_motor(st, true);
         st->pwm_active = true;
         st->pwm_phase_end = now;
@@ -208,7 +221,6 @@ static void handle_pwm_transition(struct device_rumble_state *st,
         return;
     }
     if (st->pwm_generation != generation) {
-        /* recalculate_pwm() ran after we captured the generation; skip. */
         rumble_log("pwm_transition: stale gen=%u current=%u, skipping\n",
                    generation, st->pwm_generation);
         return;
@@ -217,10 +229,15 @@ static void handle_pwm_transition(struct device_rumble_state *st,
         return;
     }
 
-    unsigned int on_us = (st->target_magnitude * RUMBLE_PWM_PERIOD_US) / 0xFFFFu;
+    /* Determine on-time from the current tier. */
+    unsigned int on_us;
+    if (st->target_magnitude < RUMBLE_TIER1) {
+        on_us = RUMBLE_DUTY_TIER0_ON_US;  /* 50% */
+    } else {
+        on_us = RUMBLE_DUTY_TIER1_ON_US;  /* 75% */
+    }
 
     if (st->motor_on) {
-        /* ON phase ended → start OFF phase. */
         unsigned int off_us = RUMBLE_PWM_PERIOD_US - on_us;
         rumble_log("pwm_transition: ON->OFF off_us=%u\n", off_us);
         set_motor(st, false);
@@ -228,10 +245,6 @@ static void handle_pwm_transition(struct device_rumble_state *st,
         timespec_add_us(&st->pwm_phase_end,
                         off_us > 0 ? off_us : RUMBLE_PWM_PERIOD_US);
     } else {
-        /* OFF phase ended → start ON phase.
-         * If on_us == 0 (magnitude at boundary), do NOT kill PWM; keep motor
-         * off and schedule another full period so recalculate_pwm() can
-         * recover when the gain/magnitude changes. */
         if (on_us == 0) {
             rumble_log("pwm_transition: OFF->OFF (on_us=0), rescheduling\n");
             st->pwm_phase_end = *now;
